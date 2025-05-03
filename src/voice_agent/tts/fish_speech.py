@@ -8,6 +8,7 @@ from livekit.agents import (
     APIConnectionError,
     tts,
     utils,
+    tokenize,
 )
 from speechlab.tts.fish_speech.client import FishSpeechRequest, FishSpeechAsyncClient
 
@@ -28,7 +29,7 @@ class FishSpeech(tts.TTS):
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(
-                streaming=False,
+                streaming=True,
             ),
             sample_rate=_SAMPLE_RATE,
             num_channels=_NUM_CHANNELS,
@@ -49,6 +50,7 @@ class FishSpeech(tts.TTS):
             temperature=temperature,
             repetition_penalty=repetition_penalty,
         )
+        self._tokenizer = tokenize.basic.SentenceTokenizer()
 
     def _make_request(self, text: str) -> FishSpeechRequest:
         self._session_id += 1
@@ -70,6 +72,16 @@ class FishSpeech(tts.TTS):
             input_text=text,
             conn_options=conn_options,
             request=self._make_request(text),
+        )
+
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = None,
+    ) -> SynthesizeStream:
+        return SynthesizeStream(
+            tts=self,
+            conn_options=conn_options,
         )
 
     def _close_client(self) -> None:
@@ -98,8 +110,8 @@ class ChunkedStream(tts.ChunkedStream):
     async def _run(self) -> None:
         request_id = utils.shortuuid()
         audio_bstream = utils.audio.AudioByteStream(
-            sample_rate=self._tts.sample_rate,
-            num_channels=self._tts.num_channels,
+            sample_rate=_SAMPLE_RATE,
+            num_channels=_NUM_CHANNELS,
         )
 
         try:
@@ -124,3 +136,46 @@ class ChunkedStream(tts.ChunkedStream):
             raise APITimeoutError() from e
         except Exception as e:
             raise APIConnectionError() from e
+
+
+class SynthesizeStream(tts.SynthesizeStream):
+    def __init__(
+        self,
+        *,
+        tts: FishSpeech,
+        conn_options: APIConnectOptions,
+    ) -> None:
+        super().__init__(tts=tts, conn_options=conn_options)
+        self._sent_stream = tts._tokenizer.stream()
+
+    async def _run(self) -> None:
+        async def _forward_input() -> None:
+            async for data in self._input_ch:
+                if isinstance(data, self._FlushSentinel):
+                    self._sent_stream.flush()
+                    continue
+                self._sent_stream.push_text(data)
+
+            self._sent_stream.end_input()
+
+        async def _synthesize() -> None:
+            async for ev in self._sent_stream:
+                last_audio: tts.SynthesizedAudio | None = None
+                async for audio in self._tts.synthesize(ev.token):
+                    if last_audio is not None:
+                        self._event_ch.send_nowait(last_audio)
+
+                    last_audio = audio
+
+                if last_audio is not None:
+                    last_audio.is_final = True
+                    self._event_ch.send_nowait(last_audio)
+
+        tasks = [
+            asyncio.create_task(_forward_input()),
+            asyncio.create_task(_synthesize()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await utils.aio.cancel_and_wait(*tasks)
